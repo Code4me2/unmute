@@ -7,7 +7,7 @@ export const metadata = {
 };
 
 const LINK =
-  "https://kyutai.org/next/legal/Privacy%20Policy%20-%20Unmute%20Voice%20Donation%20Project%20v1.pdf";
+  "https://kyutai.org/legal/Privacy%20Policy%20-%20Unmute%20Voice%20Donation%20Project%20v1.pdf";
 
 export default function PrivacyPolicyRedirect() {
   return <Redirect link={LINK} name="Voice Donation Privacy Policy" />;

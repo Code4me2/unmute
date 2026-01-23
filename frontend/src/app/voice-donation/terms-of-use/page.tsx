@@ -7,7 +7,7 @@ export const metadata = {
 };
 
 const LINK =
-  "https://kyutai.org/next/legal/Terms%20of%20Use%20-%20Unmute%20Voice%20Donation%20Project%20v1.pdf";
+  "https://kyutai.org/legal/Terms%20of%20Use%20-%20Unmute%20Voice%20Donation%20Project%20v1.pdf";
 
 export default function TermsOfUseRedirect() {
   return <Redirect link={LINK} name="Voice Donation Terms of Use" />;

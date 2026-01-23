@@ -28,7 +28,7 @@ const Unmute = () => {
   const { isDevMode, showSubtitles } = useKeyboardShortcuts();
   const [debugDict, setDebugDict] = useState<object | null>(null);
   const [unmuteConfig, setUnmuteConfig] = useState<UnmuteConfig>(
-    DEFAULT_UNMUTE_CONFIG
+    DEFAULT_UNMUTE_CONFIG,
   );
   const [rawChatHistory, setRawChatHistory] = useState<ChatMessage[]>([]);
   const chatHistory = compressChatHistory(rawChatHistory);
@@ -93,7 +93,7 @@ const Unmute = () => {
     {
       protocols: ["realtime"],
     },
-    shouldConnect
+    shouldConnect,
   );
 
   // Send microphone audio to the server (via useAudioProcessor below)
@@ -103,10 +103,10 @@ const Unmute = () => {
         JSON.stringify({
           type: "input_audio_buffer.append",
           audio: base64EncodeOpus(opus),
-        })
+        }),
       );
     },
-    [sendMessage]
+    [sendMessage],
   );
 
   const { setupAudio, shutdownAudio, audioProcessor } =
@@ -171,7 +171,7 @@ const Unmute = () => {
           command: "decode",
           pages: opus,
         },
-        [opus.buffer]
+        [opus.buffer],
       );
     } else if (data.type === "unmute.additional_outputs") {
       setDebugDict(data.args.debug_dict);
@@ -237,7 +237,7 @@ const Unmute = () => {
           voice: unmuteConfig.voice,
           allow_recording: recordingConsent,
         },
-      })
+      }),
     );
   }, [unmuteConfig, readyState, sendMessage]);
 
@@ -273,7 +273,7 @@ const Unmute = () => {
           className={clsx(
             "w-full h-auto min-h-75",
             "flex flex-row-reverse md:flex-row items-center justify-center grow",
-            "-mt-10 md:mt-0 mb-10 md:mb-0 md:-mr-4"
+            "-mt-10 md:mt-0 mb-10 md:mb-0 md:-mr-4",
           )}
         >
           <PositionedAudioVisualizer

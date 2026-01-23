@@ -58,7 +58,7 @@ const VoiceUpload = ({
 
       if (!response.ok) {
         throw new Error(
-          `Failed to upload file (${response.status} ${response.statusText}).`
+          `Failed to upload file (${response.status} ${response.statusText}).`,
         );
       }
 
@@ -78,7 +78,7 @@ const VoiceUpload = ({
       }, 1000);
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "An unknown error occurred."
+        err instanceof Error ? err.message : "An unknown error occurred.",
       );
     }
     setIsUploading(false);
@@ -106,7 +106,7 @@ const VoiceUpload = ({
           using a tool like{" "}
           <Link
             href="https://podcast.adobe.com/en/enhance"
-            className="underline"
+            className="underline text-green"
             target="_blank"
             rel="noopener"
           >
@@ -122,17 +122,29 @@ const VoiceUpload = ({
           We provide this voice cloning ability for experimental and educational
           purposes only. Use responsibly.
         </p>
-        {/* Commented out for now until we have more clarity. */}
-        <p className="mb-2">
+        <p>
           <strong>Want more voices?</strong> You can{" "}
           <Link href="/voice-donation" className="underline text-green">
             anonymously donate your voice
           </Link>{" "}
           to be added to the{" "}
-          <Link href="https://huggingface.co/kyutai/tts-voices">
+          <Link
+            href="https://huggingface.co/kyutai/tts-voices"
+            className="underline text-green"
+          >
             voice repository
           </Link>{" "}
           for use with Kyutai TTS.
+        </p>
+        <p className="mb-2">
+          Also check out{" "}
+          <Link
+            href="https://kyutai.org/pocket-tts?ref=unmute"
+            className="underline text-green"
+          >
+            Pocket TTS
+          </Link>
+          , our new 100M-parameter model with voice cloning from any file.
         </p>
         {!file && (
           <div className="flex flex-row gap-2 justify-center">
@@ -169,8 +181,8 @@ const VoiceUpload = ({
                 {isUploading
                   ? "Uploading..."
                   : file && file.name === MIC_RECORDING_FILENAME
-                  ? "Select recording"
-                  : "Select"}
+                    ? "Select recording"
+                    : "Select"}
               </SlantedButton>
             </div>
           </>
