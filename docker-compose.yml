@@ -6,18 +6,15 @@ services:
       target: hot-reloading
     volumes:
       - ./unmute:/app/unmute
+    network_mode: host
     environment:
-      - KYUTAI_STT_URL=ws://stt:8080
-      - KYUTAI_TTS_URL=ws://tts:8080
-      # Ollama configuration
-      - KYUTAI_LLM_URL=http://host.docker.internal:11434
-      - KYUTAI_LLM_MODEL=llama3.2
+      - KYUTAI_STT_URL=ws://localhost:8088
+      - KYUTAI_TTS_URL=ws://localhost:8089
+      # Remote Ollama via Tailscale
+      - KYUTAI_LLM_URL=http://100.126.172.56:11434
+      - KYUTAI_LLM_MODEL=ministral-3:14b
       - KYUTAI_LLM_API_KEY=ollama
       - NEWSAPI_API_KEY=$NEWSAPI_API_KEY
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "8000:80"
     depends_on:
       - stt
       - tts
@@ -30,6 +27,8 @@ services:
       dockerfile: public.Dockerfile
     environment:
       - HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN
+    ports:
+      - "8089:8080"
     volumes:
       - ./volumes/hf-cache:/root/.cache/huggingface
       - ./volumes/cargo-registry-tts:/root/.cargo/registry
@@ -53,6 +52,8 @@ services:
       dockerfile: public.Dockerfile
     environment:
       - HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN
+    ports:
+      - "8088:8080"
     volumes:
       - ./volumes/hf-cache:/root/.cache/huggingface
       - ./volumes/cargo-registry-stt:/root/.cargo/registry

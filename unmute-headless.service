@@ -1,0 +1,27 @@
+[Unit]
+Description=Unmute Headless Service with Remote LLM
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/tiny/Desktop/unmute
+EnvironmentFile=/home/tiny/Desktop/unmute/.env
+
+# Stop local Ollama to free GPU memory
+ExecStartPre=/usr/bin/systemctl stop ollama
+
+# Start the containers
+ExecStart=/usr/bin/docker compose up -d
+
+# Stop the containers
+ExecStop=/usr/bin/docker compose down
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
