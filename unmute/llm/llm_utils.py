@@ -327,32 +327,62 @@ async def rechunk_llm_events(
 ) -> AsyncIterator[LLMEvent]:
     """Apply word-boundary rechunking to TextDelta events only.
 
-    Non-text events flush the text buffer and pass through immediately.
-    This is the LLMEvent-aware replacement for rechunk_to_words().
+    Text between tool calls is discarded — only the final text segment (after
+    the last tool call) is yielded to TTS.  Tool call events pass through
+    immediately so pings play in real-time.
     """
     text_buffer = ""
+    saw_tool_call = False
     space_re = re.compile(r"\s+")
 
     async for event in events:
-        if not isinstance(event, TextDelta):
-            # Flush buffered text before yielding the non-text event
+        if isinstance(event, ToolCallStart):
+            # Discard any buffered intermediate text
             if text_buffer:
-                yield TextDelta(text=text_buffer)
+                logger.debug("Discarding intermediate text: %s", text_buffer[:80])
                 text_buffer = ""
+            saw_tool_call = True
             yield event
             continue
 
-        text_buffer += event.text
-        prefix = ""
+        if isinstance(event, ToolCallEnd):
+            text_buffer = ""
+            yield event
+            continue
+
+        # TextDelta
+        if saw_tool_call:
+            # We've seen at least one tool call — hold text back until
+            # we're sure there are no more tool calls coming.
+            text_buffer += event.text
+        else:
+            # No tool calls yet — stream text through with word rechunking
+            text_buffer += event.text
+            prefix = ""
+            while True:
+                match = space_re.search(text_buffer)
+                if match is None:
+                    break
+                word = text_buffer[: match.start()]
+                text_buffer = text_buffer[match.end() :]
+                if word:
+                    yield TextDelta(text=prefix + word)
+                prefix = " "
+
+    # Flush remaining text — this is either the only text (no tool calls)
+    # or the final segment after the last tool call.
+    if text_buffer:
+        # Apply word-boundary rechunking to the final flush
+        prefix = " " if saw_tool_call else ""
+        remainder = text_buffer
         while True:
-            match = space_re.search(text_buffer)
+            match = space_re.search(remainder)
             if match is None:
                 break
-            word = text_buffer[: match.start()]
-            text_buffer = text_buffer[match.end() :]
+            word = remainder[: match.start()]
+            remainder = remainder[match.end() :]
             if word:
                 yield TextDelta(text=prefix + word)
             prefix = " "
-
-    if text_buffer:
-        yield TextDelta(text=text_buffer)
+        if remainder:
+            yield TextDelta(text=prefix + remainder)
