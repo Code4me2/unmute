@@ -173,6 +173,13 @@ class UnmuteInterruptedByVAD(BaseEvent[Literal["unmute.interrupted_by_vad"]]):
     """The VAD interrupted the response generation."""
 
 
+class UnmuteToolCallEvent(BaseEvent[Literal["unmute.tool_call"]]):
+    """Tool call detected — surfaced in text transcript, audio cue played."""
+
+    tool_name: str
+    arguments: str
+
+
 # Server events (from OpenAI to client)
 ServerEvent = Union[
     Error,
@@ -189,6 +196,7 @@ ServerEvent = Union[
     UnmuteResponseTextDeltaReady,
     UnmuteResponseAudioDeltaReady,
     UnmuteInterruptedByVAD,
+    UnmuteToolCallEvent,
 ]
 
 # Client events (from client to OpenAI)

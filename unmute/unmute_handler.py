@@ -22,17 +22,22 @@ from unmute.audio_input_override import AudioInputOverride
 from unmute.exceptions import make_ora_error
 from unmute.kyutai_constants import (
     FRAME_TIME_SEC,
+    LLM_TOOLS_PATH,
     RECORDINGS_DIR,
     SAMPLE_RATE,
     SAMPLES_PER_FRAME,
 )
 from unmute.llm.chatbot import Chatbot
+from unmute.audio_cues import PING_AGENT, PING_ERROR, PING_TOOL_CALL
 from unmute.llm.llm_utils import (
     INTERRUPTION_CHAR,
     USER_SILENCE_MARKER,
+    TextDelta,
+    ToolCallEnd,
+    ToolCallStart,
     VLLMStream,
     get_openai_client,
-    rechunk_to_words,
+    rechunk_llm_events,
 )
 from unmute.quest_manager import Quest, QuestManager
 from unmute.recorder import Recorder
@@ -222,32 +227,57 @@ class UnmuteHandler(AsyncStreamHandler):
         mt.VLLM_ACTIVE_SESSIONS.inc()
 
         try:
-            async for delta in rechunk_to_words(llm.chat_completion(messages)):
-                await self.output_queue.put(
-                    ora.UnmuteResponseTextDeltaReady(delta=delta)
-                )
+            event_stream = rechunk_llm_events(
+                llm.chat_completion(messages, tools_path=LLM_TOOLS_PATH)
+            )
+            async for event in event_stream:
+                if isinstance(event, TextDelta):
+                    delta = event.text
+                    await self.output_queue.put(
+                        ora.UnmuteResponseTextDeltaReady(delta=delta)
+                    )
 
-                mt.VLLM_RECV_WORDS.inc()
-                response_words.append(delta)
+                    mt.VLLM_RECV_WORDS.inc()
+                    response_words.append(delta)
 
-                if time_to_first_token is None:
-                    time_to_first_token = llm_stopwatch.time()
-                    self.debug_dict["timing"]["to_first_token"] = time_to_first_token
-                    mt.VLLM_TTFT.observe(time_to_first_token)
-                    logger.info("Sending first word to TTS: %s", delta)
+                    if time_to_first_token is None:
+                        time_to_first_token = llm_stopwatch.time()
+                        self.debug_dict["timing"]["to_first_token"] = (
+                            time_to_first_token
+                        )
+                        mt.VLLM_TTFT.observe(time_to_first_token)
+                        logger.info("Sending first word to TTS: %s", delta)
 
-                self.tts_output_stopwatch.start_if_not_started()
-                try:
-                    tts = await quest.get()
-                except Exception:
-                    error_from_tts = True
-                    raise
+                    self.tts_output_stopwatch.start_if_not_started()
+                    try:
+                        tts = await quest.get()
+                    except Exception:
+                        error_from_tts = True
+                        raise
 
-                if len(self.chatbot.chat_history) > generating_message_i:
-                    break  # We've been interrupted
+                    if len(self.chatbot.chat_history) > generating_message_i:
+                        break  # We've been interrupted
 
-                assert isinstance(delta, str)  # make Pyright happy
-                await tts.send(delta)
+                    await tts.send(delta)
+
+                elif isinstance(event, ToolCallStart):
+                    logger.info(
+                        "Tool call: %s(%s)",
+                        event.tool_name,
+                        event.arguments_json[:80],
+                    )
+                    await self.output_queue.put(
+                        ora.UnmuteToolCallEvent(
+                            tool_name=event.tool_name,
+                            arguments=event.arguments_json,
+                        )
+                    )
+                    await self.output_queue.put(
+                        (SAMPLE_RATE, PING_TOOL_CALL.copy())
+                    )
+
+                elif isinstance(event, ToolCallEnd):
+                    pass  # No action needed for now
 
             await self.output_queue.put(
                 # The words include the whitespace, so no need to add it here
