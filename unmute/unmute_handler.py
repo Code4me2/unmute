@@ -1,9 +1,11 @@
 import asyncio
+import json
 import math
+import uuid
 from functools import partial
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, AsyncIterator, Literal, cast
 
 import numpy as np
 import websockets
@@ -22,7 +24,8 @@ from unmute.audio_input_override import AudioInputOverride
 from unmute.exceptions import make_ora_error
 from unmute.kyutai_constants import (
     FRAME_TIME_SEC,
-    LLM_TOOLS_PATH,
+    LLM_MCP_SERVERS_JSON,
+    ORCHESTRATOR_URL,
     RECORDINGS_DIR,
     SAMPLE_RATE,
     SAMPLES_PER_FRAME,
@@ -39,6 +42,7 @@ from unmute.llm.llm_utils import (
     get_openai_client,
     rechunk_llm_events,
 )
+from unmute.llm.sse_events import stream_orchestrator_events
 from unmute.quest_manager import Quest, QuestManager
 from unmute.recorder import Recorder
 from unmute.service_discovery import find_instance
@@ -54,6 +58,13 @@ from unmute.tts.text_to_speech import (
 # TTS_DEBUGGING_TEXT: str | None = "What's 'Hello world'?"
 # TTS_DEBUGGING_TEXT: str | None = "What's the difference between a bagel and a donut?"
 TTS_DEBUGGING_TEXT = None
+
+# MCP servers passed to Ollama for tool calling.
+# Set KYUTAI_LLM_MCP_SERVERS as a JSON array of server configs, e.g.:
+# [{"name":"agent","transport":"http","url":"http://host:8002/mcp"}]
+MCP_SERVERS: list[dict[str, Any]] | None = (
+    json.loads(LLM_MCP_SERVERS_JSON) if LLM_MCP_SERVERS_JSON else None
+)
 
 # AUDIO_INPUT_OVERRIDE: Path | None = Path.home() / "audio/dog-or-cat-3.mp3"
 AUDIO_INPUT_OVERRIDE: Path | None = None
@@ -105,6 +116,8 @@ class UnmuteHandler(AsyncStreamHandler):
 
         self.chatbot = Chatbot()
         self.openai_client = get_openai_client()
+        self.session_id: str = str(uuid.uuid4())
+        self.use_orchestrator: bool = ORCHESTRATOR_URL is not None
 
         self.turn_transition_lock = asyncio.Lock()
 
@@ -180,6 +193,7 @@ class UnmuteHandler(AsyncStreamHandler):
         return is_new_message
 
     async def _generate_response(self):
+        await self._cancel_events_listener()
         # Empty message to signal we've started responding.
         # Do it here in the lock to avoid race conditions
         await self.add_chat_message_delta("", "assistant")
@@ -227,9 +241,14 @@ class UnmuteHandler(AsyncStreamHandler):
         mt.VLLM_ACTIVE_SESSIONS.inc()
 
         try:
-            event_stream = rechunk_llm_events(
-                llm.chat_completion(messages, tools_path=LLM_TOOLS_PATH)
-            )
+            if self.use_orchestrator:
+                event_stream = rechunk_llm_events(
+                    llm.chat_completion(messages, session_id=self.session_id)
+                )
+            else:
+                event_stream = rechunk_llm_events(
+                    llm.chat_completion(messages, mcp_servers=MCP_SERVERS)
+                )
             async for event in event_stream:
                 if isinstance(event, TextDelta):
                     delta = event.text
@@ -261,15 +280,16 @@ class UnmuteHandler(AsyncStreamHandler):
                     await tts.send(delta)
 
                 elif isinstance(event, ToolCallStart):
+                    args_str = event.arguments_json
                     logger.info(
                         "Tool call: %s(%s)",
                         event.tool_name,
-                        event.arguments_json[:80],
+                        args_str[:80],
                     )
                     await self.output_queue.put(
                         ora.UnmuteToolCallEvent(
                             tool_name=event.tool_name,
-                            arguments=event.arguments_json,
+                            arguments=args_str,
                         )
                     )
                     await self.output_queue.put(
@@ -299,6 +319,140 @@ class UnmuteHandler(AsyncStreamHandler):
             mt.VLLM_ACTIVE_SESSIONS.dec()
             mt.VLLM_REPLY_LENGTH.observe(len(response_words))
             mt.VLLM_GEN_DURATION.observe(llm_stopwatch.time())
+
+    # ------------------------------------------------------------------
+    # Proactive announcements via orchestrator /v1/events
+    # ------------------------------------------------------------------
+
+    async def _start_events_listener(self):
+        """Start the background SSE listener for async agent results.
+
+        No-op if the orchestrator is not active.  Creates an
+        ``events_listener`` quest that blocks on ``/v1/events`` until
+        async results arrive, then streams the response through TTS.
+        """
+        if not self.use_orchestrator:
+            return
+        quest = Quest.from_run_step(
+            "events_listener", self._events_listener_task
+        )
+        await self.quest_manager.add(quest)
+
+    async def _cancel_events_listener(self):
+        """Cancel the events listener quest (e.g. user started speaking)."""
+        await self.quest_manager.remove("events_listener")
+
+    async def _events_listener_task(self):
+        """Block on orchestrator SSE until async results arrive, then speak."""
+        assert ORCHESTRATOR_URL is not None
+
+        event_iter = stream_orchestrator_events(
+            ORCHESTRATOR_URL, self.session_id
+        )
+        rechunked = rechunk_llm_events(event_iter)
+
+        # Peek at first event — blocks until async results arrive.
+        first_event = None
+        async for event in rechunked:
+            first_event = event
+            break
+
+        if first_event is None:
+            logger.info("Events listener: SSE stream ended with no events.")
+            return
+
+        # State gate: only proceed if conversation is idle.
+        if self.chatbot.conversation_state() != "waiting_for_user":
+            logger.info(
+                "Events listener: user already speaking, discarding."
+            )
+            return
+
+        # Play notification sound.
+        await self.output_queue.put((SAMPLE_RATE, PING_AGENT.copy()))
+
+        # Transition to bot_speaking.
+        await self.add_chat_message_delta("", "assistant")
+        generating_message_i = len(self.chatbot.chat_history)
+
+        await self.output_queue.put(
+            ora.ResponseCreated(
+                response=ora.Response(
+                    status="in_progress",
+                    voice=self.tts_voice or "missing",
+                    chat_history=self.chatbot.chat_history,
+                )
+            )
+        )
+
+        # Start TTS and pipe events through.
+        quest = await self.start_up_tts(generating_message_i)
+        tts = None
+        response_words: list[str] = []
+
+        try:
+
+            async def _chain_events() -> AsyncIterator[TextDelta | ToolCallStart | ToolCallEnd]:
+                assert first_event is not None
+                yield first_event
+                async for ev in rechunked:
+                    yield ev
+
+            async for event in _chain_events():
+                if isinstance(event, TextDelta):
+                    delta = event.text
+                    await self.output_queue.put(
+                        ora.UnmuteResponseTextDeltaReady(delta=delta)
+                    )
+                    response_words.append(delta)
+
+                    if tts is None:
+                        tts = await quest.get()
+                        logger.info(
+                            "Events listener: first word to TTS: %s", delta
+                        )
+
+                    if len(self.chatbot.chat_history) > generating_message_i:
+                        break  # Interrupted
+
+                    await tts.send(delta)
+
+                elif isinstance(event, ToolCallStart):
+                    args_str = event.arguments_json
+                    logger.info(
+                        "Events listener tool call: %s(%s)",
+                        event.tool_name,
+                        args_str[:80],
+                    )
+                    await self.output_queue.put(
+                        ora.UnmuteToolCallEvent(
+                            tool_name=event.tool_name,
+                            arguments=args_str,
+                        )
+                    )
+                    await self.output_queue.put(
+                        (SAMPLE_RATE, PING_TOOL_CALL.copy())
+                    )
+
+                elif isinstance(event, ToolCallEnd):
+                    pass
+
+            await self.output_queue.put(
+                ora.ResponseTextDone(text="".join(response_words))
+            )
+
+            if tts is not None:
+                logger.info("Events listener: sending TTS EOS.")
+                await tts.send(TTSClientEosMessage())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Events listener error")
+            raise
+        finally:
+            logger.info(
+                "Events listener done, %d words.", len(response_words)
+            )
 
     def audio_received_sec(self) -> float:
         """How much audio has been received in seconds. Used instead of time.time().
@@ -490,6 +644,7 @@ class UnmuteHandler(AsyncStreamHandler):
                 self.stt_last_message_time = data.start_time
                 is_new_message = await self.add_chat_message_delta(data.text, "user")
                 if is_new_message:
+                    await self._cancel_events_listener()
                     # Ensure we don't stop after the first word if the VAD didn't have
                     # time to react.
                     stt.pause_prediction.value = 0.0
@@ -609,6 +764,7 @@ class UnmuteHandler(AsyncStreamHandler):
         await asyncio.sleep(1)
         await self.check_for_bot_goodbye()
         self.waiting_for_user_start_time = self.audio_received_sec()
+        await self._start_events_listener()
 
     async def interrupt_bot(self):
         if self.chatbot.conversation_state() != "bot_speaking":
@@ -635,6 +791,7 @@ class UnmuteHandler(AsyncStreamHandler):
 
         await self.quest_manager.remove("tts")
         await self.quest_manager.remove("llm")
+        await self._cancel_events_listener()
 
     async def check_for_bot_goodbye(self):
         last_assistant_message = next(
@@ -655,6 +812,11 @@ class UnmuteHandler(AsyncStreamHandler):
 
     async def detect_long_silence(self):
         """Handle situations where the user doesn't answer for a while."""
+        # When the orchestrator is active, proactive behavior is handled
+        # by the /v1/events SSE listener instead.
+        if self.use_orchestrator:
+            return
+
         if (
             self.chatbot.conversation_state() == "waiting_for_user"
             and (self.audio_received_sec() - self.waiting_for_user_start_time)
