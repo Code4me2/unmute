@@ -180,6 +180,22 @@ class UnmuteToolCallEvent(BaseEvent[Literal["unmute.tool_call"]]):
     arguments: str
 
 
+class UnmuteAgentResultEvent(BaseEvent[Literal["unmute.agent_result"]]):
+    """Async agent results arrived — proactive announcement starting."""
+
+    agents: list[str]
+
+
+class UnmuteAgentProgressEvent(BaseEvent[Literal["unmute.agent_progress"]]):
+    """Real-time progress from a delegated agent — silent, for UI display only."""
+
+    agent: str
+    progress_type: str  # "tool_call" or "tool_result"
+    tool: str
+    arguments: dict | None = None
+    content: str | None = None
+
+
 # Server events (from OpenAI to client)
 ServerEvent = Union[
     Error,
@@ -197,6 +213,8 @@ ServerEvent = Union[
     UnmuteResponseAudioDeltaReady,
     UnmuteInterruptedByVAD,
     UnmuteToolCallEvent,
+    UnmuteAgentResultEvent,
+    UnmuteAgentProgressEvent,
 ]
 
 # Client events (from client to OpenAI)

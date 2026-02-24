@@ -48,7 +48,25 @@ class ToolCallEnd:
     pass
 
 
-LLMEvent = TextDelta | ToolCallStart | ToolCallEnd
+@dataclass
+class AgentInjection:
+    """Async agent results have arrived via SSE."""
+
+    agents: list[str]
+
+
+@dataclass
+class AgentProgress:
+    """Real-time progress from a delegated agent — silent, no TTS."""
+
+    agent: str
+    progress_type: str  # "tool_call" or "tool_result"
+    tool: str
+    arguments: dict[str, Any] | None = None
+    content: str | None = None
+
+
+LLMEvent = TextDelta | ToolCallStart | ToolCallEnd | AgentInjection | AgentProgress
 
 
 def preprocess_messages_for_llm(
@@ -198,7 +216,8 @@ class VLLMStream:
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
-        tools_path: str | None = None,
+        mcp_servers: list[dict[str, Any]] | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[LLMEvent]:
         """Stream a chat completion, yielding LLMEvent instances.
 
@@ -212,8 +231,10 @@ class VLLMStream:
             stream=True,
             temperature=self.temperature,
         )
-        if tools_path:
-            create_kwargs["extra_body"] = {"tools_path": tools_path}
+        if session_id:
+            create_kwargs["extra_body"] = {"session_id": session_id}
+        elif mcp_servers:
+            create_kwargs["extra_body"] = {"mcp_servers": mcp_servers}
 
         stream = await self.client.chat.completions.create(**create_kwargs)
 
@@ -227,6 +248,8 @@ class VLLMStream:
 
         async with stream:
             async for chunk in stream:
+                if not chunk.choices:
+                    continue  # e.g. orchestrator internal MCP execution
                 choice = chunk.choices[0]
                 delta = choice.delta
 
@@ -238,9 +261,12 @@ class VLLMStream:
                             continue  # duplicate chunk
                         if tc_id:
                             seen_tool_call_ids.add(tc_id)
+                        args = tc.function.arguments or ""
+                        if not isinstance(args, str):
+                            args = json.dumps(args)
                         yield ToolCallStart(
                             tool_name=tc.function.name or "",
-                            arguments_json=tc.function.arguments or "",
+                            arguments_json=args,
                             tool_call_id=tc_id,
                         )
                     continue
@@ -347,6 +373,10 @@ async def rechunk_llm_events(
 
         if isinstance(event, ToolCallEnd):
             text_buffer = ""
+            yield event
+            continue
+
+        if isinstance(event, (AgentInjection, AgentProgress)):
             yield event
             continue
 

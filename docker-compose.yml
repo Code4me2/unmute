@@ -10,11 +10,12 @@ services:
     environment:
       - KYUTAI_STT_URL=ws://localhost:8088
       - KYUTAI_TTS_URL=ws://localhost:8089
-      # Remote Ollama via Tailscale
+      # Orchestrator via Tailscale (handles agent discovery + async delegation)
+      - KYUTAI_ORCHESTRATOR_URL=http://100.126.172.56:8000
+      # Fallback: direct Ollama (used when orchestrator is not set)
       - KYUTAI_LLM_URL=http://100.126.172.56:11434
       - KYUTAI_LLM_MODEL=ministral-3:14b
       - KYUTAI_LLM_API_KEY=ollama
-      - KYUTAI_LLM_TOOLS_PATH=/home/velvetm/Desktop/mcp-test-files
       - NEWSAPI_API_KEY=$NEWSAPI_API_KEY
     depends_on:
       - stt

@@ -35,6 +35,9 @@ from unmute.audio_cues import PING_AGENT, PING_ERROR, PING_TOOL_CALL
 from unmute.llm.llm_utils import (
     INTERRUPTION_CHAR,
     USER_SILENCE_MARKER,
+    AgentInjection,
+    AgentProgress,
+    LLMEvent,
     TextDelta,
     ToolCallEnd,
     ToolCallStart,
@@ -299,6 +302,17 @@ class UnmuteHandler(AsyncStreamHandler):
                 elif isinstance(event, ToolCallEnd):
                     pass  # No action needed for now
 
+                elif isinstance(event, AgentProgress):
+                    await self.output_queue.put(
+                        ora.UnmuteAgentProgressEvent(
+                            agent=event.agent,
+                            progress_type=event.progress_type,
+                            tool=event.tool,
+                            arguments=event.arguments,
+                            content=event.content,
+                        )
+                    )
+
             await self.output_queue.put(
                 # The words include the whitespace, so no need to add it here
                 ora.ResponseTextDone(text="".join(response_words))
@@ -351,9 +365,22 @@ class UnmuteHandler(AsyncStreamHandler):
         )
         rechunked = rechunk_llm_events(event_iter)
 
-        # Peek at first event — blocks until async results arrive.
+        # Consume events until we find the first non-progress event.
+        # AgentProgress events arrive before AgentInjection on the SSE
+        # stream, so we forward them to the UI while waiting.
         first_event = None
         async for event in rechunked:
+            if isinstance(event, AgentProgress):
+                await self.output_queue.put(
+                    ora.UnmuteAgentProgressEvent(
+                        agent=event.agent,
+                        progress_type=event.progress_type,
+                        tool=event.tool,
+                        arguments=event.arguments,
+                        content=event.content,
+                    )
+                )
+                continue
             first_event = event
             break
 
@@ -368,7 +395,20 @@ class UnmuteHandler(AsyncStreamHandler):
             )
             return
 
-        # Play notification sound.
+        # Emit agent result notification + audio cue.
+        if isinstance(first_event, AgentInjection):
+            await self.output_queue.put(
+                ora.UnmuteAgentResultEvent(agents=first_event.agents)
+            )
+            # Consume the injection event; next events will be text/tool calls.
+            first_event = None
+            async for event in rechunked:
+                first_event = event
+                break
+            if first_event is None:
+                logger.info("Events listener: no content after injection.")
+                return
+
         await self.output_queue.put((SAMPLE_RATE, PING_AGENT.copy()))
 
         # Transition to bot_speaking.
@@ -392,7 +432,7 @@ class UnmuteHandler(AsyncStreamHandler):
 
         try:
 
-            async def _chain_events() -> AsyncIterator[TextDelta | ToolCallStart | ToolCallEnd]:
+            async def _chain_events() -> AsyncIterator[LLMEvent]:
                 assert first_event is not None
                 yield first_event
                 async for ev in rechunked:
@@ -436,6 +476,17 @@ class UnmuteHandler(AsyncStreamHandler):
 
                 elif isinstance(event, ToolCallEnd):
                     pass
+
+                elif isinstance(event, AgentProgress):
+                    await self.output_queue.put(
+                        ora.UnmuteAgentProgressEvent(
+                            agent=event.agent,
+                            progress_type=event.progress_type,
+                            tool=event.tool,
+                            arguments=event.arguments,
+                            content=event.content,
+                        )
+                    )
 
             await self.output_queue.put(
                 ora.ResponseTextDone(text="".join(response_words))

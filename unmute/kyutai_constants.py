@@ -8,10 +8,11 @@ HEADERS = {"kyutai-api-key": "public_token"}
 # The defaults are already ws://, but make the env vars support http:// and https://
 STT_SERVER = http_to_ws(os.environ.get("KYUTAI_STT_URL", "ws://localhost:8090"))
 TTS_SERVER = http_to_ws(os.environ.get("KYUTAI_TTS_URL", "ws://localhost:8089"))
-LLM_SERVER = os.environ.get("KYUTAI_LLM_URL", "http://localhost:8091")
+ORCHESTRATOR_URL = os.environ.get("KYUTAI_ORCHESTRATOR_URL")
+LLM_SERVER = ORCHESTRATOR_URL or os.environ.get("KYUTAI_LLM_URL", "http://localhost:8091")
 KYUTAI_LLM_MODEL = os.environ.get("KYUTAI_LLM_MODEL")
 KYUTAI_LLM_API_KEY = os.environ.get("KYUTAI_LLM_API_KEY")
-LLM_TOOLS_PATH = os.environ.get("KYUTAI_LLM_TOOLS_PATH")
+LLM_MCP_SERVERS_JSON = os.environ.get("KYUTAI_LLM_MCP_SERVERS")
 VOICE_CLONING_SERVER = os.environ.get(
     "KYUTAI_VOICE_CLONING_URL", "http://localhost:8092"
 )
