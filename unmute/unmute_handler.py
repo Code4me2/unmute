@@ -1,6 +1,8 @@
 import asyncio
 import json
 import math
+import os
+import threading
 import uuid
 from functools import partial
 from logging import getLogger
@@ -8,6 +10,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Literal, cast
 
 import numpy as np
+import soxr
 import websockets
 from fastrtc import (
     AdditionalOutputs,
@@ -83,6 +86,17 @@ FURTHER_MESSAGES_TEMPERATURE = 0.3
 # A word from the ASR can still interrupt the bot.
 UNINTERRUPTIBLE_BY_VAD_TIME_SEC = 3
 
+# Speaker gate constants
+GATE_SAMPLE_RATE = 16000
+GATE_BUFFER_SEC = 1.5
+GATE_BUFFER_SAMPLES = int(GATE_SAMPLE_RATE * GATE_BUFFER_SEC)
+# Number of silent frames before resetting the gate cache
+GATE_SILENCE_RESET_FRAMES = 15  # ~1.2s at 80ms/frame
+# After this many consecutive rejections, bypass the gate
+GATE_CONSECUTIVE_REJECT_BYPASS = 5
+# Threshold elevation when TTS is playing (to reject loopback)
+GATE_TTS_THRESHOLD_BOOST = 0.10
+
 logger = getLogger(__name__)
 
 HandlerOutput = (
@@ -136,6 +150,42 @@ class UnmuteHandler(AsyncStreamHandler):
             self.audio_input_override = AudioInputOverride(AUDIO_INPUT_OVERRIDE)
         else:
             self.audio_input_override = None
+
+        # Speaker gate
+        enrollment_path = os.environ.get("SPEAKER_GATE_ENROLLMENT")
+        gate_threshold = float(os.environ.get("SPEAKER_GATE_THRESHOLD", "0.65"))
+        gate_model = os.environ.get("SPEAKER_GATE_MODEL", "/data/wespeaker.onnx")
+        if enrollment_path and Path(enrollment_path).is_file():
+            from unmute.speaker_gate import SpeakerGate
+
+            self._speaker_gate = SpeakerGate(
+                enrollment_path, threshold=gate_threshold, model_path=gate_model
+            )
+            self._speaker_gate_enabled = True
+            logger.info("[SpeakerGate] Enabled (enrollment=%s)", enrollment_path)
+        else:
+            self._speaker_gate = None
+            self._speaker_gate_enabled = False
+            if enrollment_path:
+                logger.warning(
+                    "[SpeakerGate] Enrollment file not found: %s — gate disabled",
+                    enrollment_path,
+                )
+
+        # Gate circular buffer (16kHz mono float32)
+        self._gate_buf = np.zeros(GATE_BUFFER_SAMPLES, dtype=np.float32)
+        self._gate_write_idx = 0
+        self._gate_samples_written = 0
+        self._gate_lock = threading.Lock()
+        self._gate_verified = False
+        self._gate_score = 0.0
+        self._gate_silence_frames = 0
+        self._gate_consecutive_rejects = 0
+
+        # Warm up ONNX model
+        if self._speaker_gate_enabled:
+            assert self._speaker_gate is not None
+            self._speaker_gate.warmup()
 
     async def cleanup(self):
         if self.recorder is not None:
@@ -505,6 +555,130 @@ class UnmuteHandler(AsyncStreamHandler):
                 "Events listener done, %d words.", len(response_words)
             )
 
+    # ------------------------------------------------------------------
+    # Speaker gate helpers
+    # ------------------------------------------------------------------
+
+    def _gate_resample(self, audio_24k: np.ndarray) -> np.ndarray:
+        """Resample 24kHz audio to 16kHz for the speaker gate."""
+        return soxr.resample(audio_24k, SAMPLE_RATE, GATE_SAMPLE_RATE).astype(
+            np.float32
+        )
+
+    def _gate_append(self, audio_16k: np.ndarray) -> None:
+        """Write samples into the circular buffer."""
+        n = len(audio_16k)
+        with self._gate_lock:
+            if n >= GATE_BUFFER_SAMPLES:
+                # Audio larger than buffer — just keep the tail
+                self._gate_buf[:] = audio_16k[-GATE_BUFFER_SAMPLES:]
+                self._gate_write_idx = 0
+            else:
+                end = self._gate_write_idx + n
+                if end <= GATE_BUFFER_SAMPLES:
+                    self._gate_buf[self._gate_write_idx : end] = audio_16k
+                else:
+                    first = GATE_BUFFER_SAMPLES - self._gate_write_idx
+                    self._gate_buf[self._gate_write_idx :] = audio_16k[:first]
+                    self._gate_buf[: n - first] = audio_16k[first:]
+                self._gate_write_idx = end % GATE_BUFFER_SAMPLES
+            self._gate_samples_written += n
+
+    def _gate_get_buffer(self) -> np.ndarray:
+        """Return the circular buffer contents as a contiguous array."""
+        with self._gate_lock:
+            available = min(self._gate_samples_written, GATE_BUFFER_SAMPLES)
+            if available == 0:
+                return np.zeros(0, dtype=np.float32)
+            if self._gate_samples_written < GATE_BUFFER_SAMPLES:
+                return self._gate_buf[:available].copy()
+            # Full buffer — re-order from write pointer
+            return np.roll(self._gate_buf, -self._gate_write_idx).copy()
+
+    def _gate_check(self) -> bool:
+        """Run speaker verification. Returns True if the enrolled user is speaking.
+
+        Uses cached result if still valid. Elevates threshold when TTS is
+        playing to reject loopback audio. After several consecutive rejects,
+        bypasses the gate (fail-open) so the user isn't locked out.
+        """
+        if not self._speaker_gate_enabled:
+            return True
+
+        assert self._speaker_gate is not None
+
+        # Return cached result if available
+        if self._gate_verified:
+            return True
+
+        buf = self._gate_get_buffer()
+        # Need at least 0.5s of audio
+        if len(buf) < GATE_SAMPLE_RATE // 2:
+            logger.debug("[SpeakerGate] Not enough audio (%d samples)", len(buf))
+            return False
+
+        threshold = self._speaker_gate.threshold
+
+        # Elevate threshold during TTS playback to reject mic loopback
+        if self.chatbot.conversation_state() == "bot_speaking":
+            threshold += GATE_TTS_THRESHOLD_BOOST
+
+        try:
+            match, score = self._speaker_gate.verify_with_score(buf, GATE_SAMPLE_RATE)
+            # Use the possibly-elevated threshold
+            match = score >= threshold
+        except Exception:
+            logger.exception("[SpeakerGate] Verification error — allowing barge-in")
+            return True
+
+        self._gate_score = score
+
+        if match:
+            self._gate_verified = True
+            self._gate_consecutive_rejects = 0
+            logger.info("[SpeakerGate] ACCEPT (score=%.3f, threshold=%.2f)", score, threshold)
+            return True
+
+        self._gate_consecutive_rejects += 1
+        if self._gate_consecutive_rejects >= GATE_CONSECUTIVE_REJECT_BYPASS:
+            logger.warning(
+                "[SpeakerGate] BYPASS after %d consecutive rejects (score=%.3f)",
+                self._gate_consecutive_rejects,
+                score,
+            )
+            self._gate_consecutive_rejects = 0
+            return True
+
+        logger.info(
+            "[SpeakerGate] REJECT (score=%.3f, threshold=%.2f, streak=%d/%d)",
+            score,
+            threshold,
+            self._gate_consecutive_rejects,
+            GATE_CONSECUTIVE_REJECT_BYPASS,
+        )
+        return False
+
+    def _gate_on_speech_frame(self, float_audio: np.ndarray) -> None:
+        """Called for each audio frame — resample and buffer."""
+        audio_16k = self._gate_resample(float_audio)
+        self._gate_append(audio_16k)
+        self._gate_silence_frames = 0
+
+    def _gate_on_silence_frame(self) -> None:
+        """Track silence; reset gate cache after prolonged silence."""
+        self._gate_silence_frames += 1
+        if self._gate_silence_frames >= GATE_SILENCE_RESET_FRAMES:
+            self._gate_reset_locked()
+
+    def _gate_reset_locked(self) -> None:
+        """Zero out the buffer and reset verification cache."""
+        with self._gate_lock:
+            self._gate_buf[:] = 0
+            self._gate_write_idx = 0
+            self._gate_samples_written = 0
+        self._gate_verified = False
+        self._gate_score = 0.0
+
     def audio_received_sec(self) -> float:
         """How much audio has been received in seconds. Used instead of time.time().
 
@@ -527,6 +701,10 @@ class UnmuteHandler(AsyncStreamHandler):
         # the process is busy with something else, which is bad.
         self.debug_dict["last_receive_time"] = self.audio_received_sec()
         float_audio = audio_to_float32(array)
+
+        # Buffer audio for speaker gate verification
+        if self._speaker_gate_enabled:
+            self._gate_on_speech_frame(float_audio)
 
         self.debug_plot_data.append(
             {
@@ -589,9 +767,14 @@ class UnmuteHandler(AsyncStreamHandler):
                 and stt.pause_prediction.value < 0.4
                 and self.audio_received_sec() > UNINTERRUPTIBLE_BY_VAD_TIME_SEC
             ):
-                logger.info("Interruption by STT-VAD")
-                await self.interrupt_bot()
-                await self.add_chat_message_delta("", "user")
+                if self._gate_check():
+                    logger.info("Interruption by STT-VAD")
+                    await self.interrupt_bot()
+                    await self.add_chat_message_delta("", "user")
+
+            # Track silence for gate cache reset
+            if self._speaker_gate_enabled and stt.pause_prediction.value > 0.8:
+                self._gate_on_silence_frame()
         else:
             # We do not try to detect interruption here, the STT would be processing
             # a chunk full of 0, so there is little chance the pause score would indicate an interruption.
@@ -689,8 +872,11 @@ class UnmuteHandler(AsyncStreamHandler):
                     continue
 
                 if self.chatbot.conversation_state() == "bot_speaking":
-                    logger.info("STT-based interruption")
-                    await self.interrupt_bot()
+                    if self._gate_check():
+                        logger.info("STT-based interruption")
+                        await self.interrupt_bot()
+                    else:
+                        continue  # Rejected speaker — skip this word
 
                 self.stt_last_message_time = data.start_time
                 is_new_message = await self.add_chat_message_delta(data.text, "user")

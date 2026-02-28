@@ -18,6 +18,7 @@ dependencies = [
     "ruamel-yaml>=0.18.10",
     "redis>=6.0.0",
     "unidecode>=1.4.0",
+    "onnxruntime>=1.16.0",
 ]
 
 [build-system]
@@ -71,6 +72,9 @@ ignore = [
 ]
 
 pydocstyle.convention = "google" # Google docstring style
+
+[tool.uv]
+constraint-dependencies = ["av<14.4"]
 
 [dependency-groups]
 dev = [

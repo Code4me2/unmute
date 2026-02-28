@@ -1,11 +1,14 @@
 services:
   backend:
     image: unmute-backend:latest
+    restart: unless-stopped
     build:
       context: ./
       target: hot-reloading
     volumes:
       - ./unmute:/app/unmute
+      # Mount enrollment dir (not file) — gate auto-disables if .npy is missing
+      - ./enrollment:/data/enrollment:ro
     network_mode: host
     environment:
       - KYUTAI_STT_URL=ws://localhost:8088
@@ -17,12 +20,16 @@ services:
       - KYUTAI_LLM_MODEL=ministral-3:14b
       - KYUTAI_LLM_API_KEY=ollama
       - NEWSAPI_API_KEY=$NEWSAPI_API_KEY
+      - SPEAKER_GATE_ENROLLMENT=/data/enrollment/user_profile.npy
+      - SPEAKER_GATE_THRESHOLD=0.65
+      - SPEAKER_GATE_MODEL=/data/wespeaker.onnx
     depends_on:
       - stt
       - tts
 
   tts:
     image: moshi-server:latest
+    restart: unless-stopped
     command: ["worker", "--config", "configs/tts.toml"]
     build:
       context: services/moshi-server
@@ -48,6 +55,7 @@ services:
 
   stt:
     image: moshi-server:latest
+    restart: unless-stopped
     command: ["worker", "--config", "configs/stt.toml"]
     build:
       context: services/moshi-server

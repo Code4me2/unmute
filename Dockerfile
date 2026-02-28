@@ -7,6 +7,12 @@ RUN --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv run --no-dev echo hello
 
+# Pre-download WeSpeaker ONNX model for speaker gate
+RUN mkdir -p /data && apt-get update && apt-get install -y --no-install-recommends wget \
+    && wget -q -O /data/wespeaker.onnx \
+       'https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/main/voxceleb_resnet34_LM.onnx' \
+    && apt-get purge -y wget && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 ENV HOSTNAME="0.0.0.0"
 
